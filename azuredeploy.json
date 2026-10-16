@@ -1,0 +1,418 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "title": "Delete-Expired-CTIX-Indicators",
+    "description": "Scheduled playbook that deletes expired (validUntil earlier than now) threat intelligence indicators whose source is CywareCTIX from Microsoft Sentinel. Indicators from other sources and unexpired indicators are never deleted.",
+    "prerequisites": [
+      "1. Microsoft Sentinel enabled on an existing Log Analytics workspace",
+      "2. The Cyware CTIX data connector is sending indicators with source CywareCTIX",
+      "3. Owner or User Access Administrator on the workspace, to assign the role after deployment"
+    ],
+    "postDeployment": [
+      "**a. Manual role assignment required**",
+      "The playbook uses its system-assigned Managed Identity to call the Microsoft Sentinel REST API (query and delete indicators). Without a role every run fails with 403.",
+      "1. Open the Log Analytics workspace > Access control (IAM) > Add > Add role assignment",
+      "2. Role: Microsoft Sentinel Contributor. Scope: the workspace (not the subscription or the Logic App resource group)",
+      "3. Assign access to: Managed identity > Logic app > select this playbook",
+      "4. Wait a few minutes for the role to propagate, then run the Logic App once (Run trigger) and check the run history",
+      "**b. Warning:** the playbook deletes expired indicators on every run, starting with the first scheduled run."
+    ],
+    "prerequisitesDeployTemplateFile": "",
+    "lastUpdateTime": "2026-10-15T00:00:00.000Z",
+    "entities": [],
+    "tags": [
+      "Maintenance",
+      "Threat Intelligence"
+    ],
+    "support": {
+      "tier": "Community",
+      "armtemplate": "Hand-authored ARM template"
+    },
+    "author": {
+      "name": "Crest Data"
+    }
+  },
+  "parameters": {
+    "PlaybookName": {
+      "type": "string",
+      "defaultValue": "CywareDeleteExpiredCTIXIndicators",
+      "minLength": 1,
+      "maxLength": 80,
+      "metadata": {
+        "description": "Name of the Logic App (playbook)."
+      }
+    },
+    "location": {
+      "type": "string",
+      "metadata": {
+        "description": "Region of the Logic App (for example eastus). Required."
+      }
+    },
+    "workspaceName": {
+      "type": "string",
+      "metadata": {
+        "description": "Name of the Microsoft Sentinel (Log Analytics) workspace."
+      },
+      "minLength": 1
+    },
+    "workspaceResourceGroup": {
+      "type": "string",
+      "metadata": {
+        "description": "Resource group that contains the Microsoft Sentinel workspace. Required."
+      },
+      "minLength": 1
+    },
+    "workspaceSubscriptionId": {
+      "type": "string",
+      "metadata": {
+        "description": "Subscription ID that contains the Microsoft Sentinel workspace. Required."
+      },
+      "minLength": 1
+    },
+    "intervalHours": {
+      "type": "int",
+      "defaultValue": 1,
+      "minValue": 1,
+      "metadata": {
+        "description": "How often the playbook runs, in hours."
+      }
+    }
+  },
+  "variables": {
+    "armAudience": "[substring(variables('armEndpoint'), 0, sub(length(variables('armEndpoint')), 1))]",
+    "indicatorSource": "CywareCTIX",
+    "maxBatches": 150,
+    "deleteConcurrency": 5,
+    "armEndpoint": "[if(endsWith(environment().resourceManager, '/'), environment().resourceManager, concat(environment().resourceManager, '/'))]",
+    "userAgent": "azure-sentinel-cyware-ctix-delete-expired/1.0.0"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Logic/workflows",
+      "apiVersion": "2019-05-01",
+      "name": "[parameters('PlaybookName')]",
+      "location": "[parameters('location')]",
+      "identity": {
+        "type": "SystemAssigned"
+      },
+      "properties": {
+        "state": "Enabled",
+        "definition": {
+          "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+          "contentVersion": "1.0.0.0",
+          "triggers": {
+            "Recurrence": {
+              "type": "Recurrence",
+              "recurrence": {
+                "frequency": "Hour",
+                "interval": "[parameters('intervalHours')]"
+              }
+            }
+          },
+          "actions": {
+            "Init_subscriptionId": {
+              "type": "InitializeVariable",
+              "runAfter": {},
+              "inputs": {
+                "variables": [
+                  {
+                    "name": "subscriptionId",
+                    "type": "string",
+                    "value": "[parameters('workspaceSubscriptionId')]"
+                  }
+                ]
+              }
+            },
+            "Init_resourceGroup": {
+              "type": "InitializeVariable",
+              "runAfter": {
+                "Init_subscriptionId": [
+                  "Succeeded"
+                ]
+              },
+              "inputs": {
+                "variables": [
+                  {
+                    "name": "resourceGroup",
+                    "type": "string",
+                    "value": "[parameters('workspaceResourceGroup')]"
+                  }
+                ]
+              }
+            },
+            "Init_workspace": {
+              "type": "InitializeVariable",
+              "runAfter": {
+                "Init_resourceGroup": [
+                  "Succeeded"
+                ]
+              },
+              "inputs": {
+                "variables": [
+                  {
+                    "name": "workspace",
+                    "type": "string",
+                    "value": "[parameters('workspaceName')]"
+                  }
+                ]
+              }
+            },
+            "Init_sourceFilter": {
+              "type": "InitializeVariable",
+              "runAfter": {
+                "Init_workspace": [
+                  "Succeeded"
+                ]
+              },
+              "inputs": {
+                "variables": [
+                  {
+                    "name": "sourceFilter",
+                    "type": "string",
+                    "value": "[variables('indicatorSource')]"
+                  }
+                ]
+              }
+            },
+            "Init_runStart": {
+              "type": "InitializeVariable",
+              "runAfter": {
+                "Init_armEndpoint": [
+                  "Succeeded"
+                ]
+              },
+              "inputs": {
+                "variables": [
+                  {
+                    "name": "runStart",
+                    "type": "string",
+                    "value": "@{utcNow()}"
+                  }
+                ]
+              }
+            },
+            "Init_batchCount": {
+              "type": "InitializeVariable",
+              "runAfter": {
+                "Init_runStart": [
+                  "Succeeded"
+                ]
+              },
+              "inputs": {
+                "variables": [
+                  {
+                    "name": "batchCount",
+                    "type": "integer",
+                    "value": -1
+                  }
+                ]
+              }
+            },
+            "Until_no_more_expired": {
+              "type": "Until",
+              "runAfter": {
+                "Init_totalDeleted": [
+                  "Succeeded"
+                ]
+              },
+              "expression": "@equals(variables('batchCount'), 0)",
+              "limit": {
+                "count": "[variables('maxBatches')]",
+                "timeout": "PT2H"
+              },
+              "actions": {
+                "Query_expired": {
+                  "type": "Http",
+                  "runAfter": {},
+                  "inputs": {
+                    "method": "POST",
+                    "uri": "@{concat(variables('armEndpoint'), 'subscriptions/', variables('subscriptionId'), '/resourceGroups/', variables('resourceGroup'), '/providers/Microsoft.OperationalInsights/workspaces/', variables('workspace'), '/providers/Microsoft.SecurityInsights/threatIntelligence/main/queryIndicators?api-version=2025-09-01')}",
+                    "headers": {
+                      "Content-Type": "application/json",
+                      "User-Agent": "[variables('userAgent')]"
+                    },
+                    "body": {
+                      "pageSize": 100,
+                      "includeDisabled": true,
+                      "sources": [
+                        "@{variables('sourceFilter')}"
+                      ],
+                      "minValidUntil": "1970-01-01T00:00:00Z",
+                      "maxValidUntil": "@{variables('runStart')}"
+                    },
+                    "authentication": {
+                      "type": "ManagedServiceIdentity",
+                      "audience": "[variables('armAudience')]"
+                    }
+                  }
+                },
+                "Filter_source_only": {
+                  "type": "Query",
+                  "runAfter": {
+                    "Query_expired": [
+                      "Succeeded"
+                    ]
+                  },
+                  "inputs": {
+                    "from": "@coalesce(body('Query_expired')?['value'], json('[]'))",
+                    "where": "@equals(toLower(coalesce(item()?['properties']?['source'], '')), toLower(variables('sourceFilter')))"
+                  }
+                },
+                "Set_batchCount": {
+                  "type": "SetVariable",
+                  "runAfter": {
+                    "Filter_source_only": [
+                      "Succeeded"
+                    ]
+                  },
+                  "inputs": {
+                    "name": "batchCount",
+                    "value": "@length(body('Filter_source_only'))"
+                  }
+                },
+                "For_each_expired": {
+                  "type": "Foreach",
+                  "runAfter": {
+                    "Set_batchCount": [
+                      "Succeeded"
+                    ]
+                  },
+                  "foreach": "@body('Filter_source_only')",
+                  "runtimeConfiguration": {
+                    "concurrency": {
+                      "repetitions": "[variables('deleteConcurrency')]"
+                    }
+                  },
+                  "actions": {
+                    "Delete_indicator": {
+                      "type": "Http",
+                      "runAfter": {},
+                      "inputs": {
+                        "method": "DELETE",
+                        "uri": "@{concat(variables('armEndpoint'), 'subscriptions/', variables('subscriptionId'), '/resourceGroups/', variables('resourceGroup'), '/providers/Microsoft.OperationalInsights/workspaces/', variables('workspace'), '/providers/Microsoft.SecurityInsights/threatIntelligence/main/indicators/', items('For_each_expired')?['name'], '?api-version=2025-09-01')}",
+                        "authentication": {
+                          "type": "ManagedServiceIdentity",
+                          "audience": "[variables('armAudience')]"
+                        },
+                        "headers": {
+                          "User-Agent": "[variables('userAgent')]"
+                        }
+                      }
+                    }
+                  }
+                },
+                "Add_to_totalDeleted": {
+                  "type": "IncrementVariable",
+                  "runAfter": {
+                    "For_each_expired": [
+                      "Succeeded"
+                    ]
+                  },
+                  "inputs": {
+                    "name": "totalDeleted",
+                    "value": "@variables('batchCount')"
+                  }
+                }
+              }
+            },
+            "Handle_failure": {
+              "type": "Terminate",
+              "runAfter": {
+                "Until_no_more_expired": [
+                  "Failed",
+                  "TimedOut"
+                ]
+              },
+              "inputs": {
+                "runStatus": "Failed",
+                "runError": {
+                  "code": "CTIXExpiredIndicatorCleanupFailed",
+                  "message": "Query or delete of expired CywareCTIX indicators failed, or the batch/time limit was reached with indicators remaining. Open the run history and check Query_expired and Delete_indicator. A 403 means the Logic App managed identity does not have the Microsoft Sentinel Contributor role on the workspace."
+                }
+              }
+            },
+            "Init_totalDeleted": {
+              "type": "InitializeVariable",
+              "runAfter": {
+                "Init_batchCount": [
+                  "Succeeded"
+                ]
+              },
+              "inputs": {
+                "variables": [
+                  {
+                    "name": "totalDeleted",
+                    "type": "integer",
+                    "value": 0
+                  }
+                ]
+              }
+            },
+            "If_nothing_expired": {
+              "type": "If",
+              "runAfter": {
+                "Until_no_more_expired": [
+                  "Succeeded"
+                ]
+              },
+              "expression": {
+                "and": [
+                  {
+                    "equals": [
+                      "@variables('totalDeleted')",
+                      0
+                    ]
+                  }
+                ]
+              },
+              "actions": {
+                "Terminate_cancelled_no_expired": {
+                  "type": "Terminate",
+                  "runAfter": {},
+                  "inputs": {
+                    "runStatus": "Cancelled"
+                  }
+                }
+              },
+              "else": {
+                "actions": {}
+              }
+            },
+            "Init_armEndpoint": {
+              "type": "InitializeVariable",
+              "runAfter": {
+                "Init_sourceFilter": [
+                  "Succeeded"
+                ]
+              },
+              "inputs": {
+                "variables": [
+                  {
+                    "name": "armEndpoint",
+                    "type": "string",
+                    "value": "[variables('armEndpoint')]"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      },
+      "tags": {
+        "hidden-SentinelTemplateName": "Delete-Expired-CTIX-Indicators",
+        "hidden-SentinelTemplateVersion": "1.0"
+      }
+    }
+  ],
+  "outputs": {
+    "PlaybookName": {
+      "type": "string",
+      "value": "[parameters('PlaybookName')]"
+    },
+    "principalId": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.Logic/workflows', parameters('PlaybookName')), '2019-05-01', 'Full').identity.principalId]"
+    }
+  }
+}
